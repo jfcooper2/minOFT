@@ -11,52 +11,39 @@ import torch
 import torch.nn.utils.parametrize as parametrize
 from torch import nn
 
-from .blockdiag_butterfly_multiply import blockdiag_butterfly_multiply
-
+from src.models.layers.monarch_linear import MonarchLinear
 
 class LoRAParametrization(nn.Module):
-    def __init__(self, fan_in, fan_out, fan_in_fan_out=False, rank=4, num_blocks=(4,4), lora_dropout_p=0.0, lora_alpha=1):
+    # def __init__(self, fan_in, fan_out, fan_in_fan_out=False, rank=4, lora_dropout_p=0.0, lora_alpha=1):
+    def __init__(self, fan_in, fan_out, fan_in_fan_out=False, rank=4,
+                 lora_dropout_p=0.0, lora_alpha=1, nblocks=4, adapt=True):
         super().__init__()
         # if weight is stored as (fan_out, fan_in), the memory layout of A & B follows (W + BA)x
         # otherwise, it's x(W + AB). This allows us to tie the weights between linear layers and embeddings
-#         self.swap = (lambda x: (x[1], x[0])) if fan_in_fan_out else (lambda x: x)
-        
-        self.fan_in, self.fan_out, self.rank = fan_in, fan_out, rank
-        
-        # num_blocks_in   : k
-        # blk_height_in   : q
-        # blk_width_in    : p
-        # num_blocks_out  : l
-        # blk_height_out  : s
-        # blk_width_out   : r
-        # btfly_in        : k*p (close to fan_in)
-        # btfly_out       : l*s (close to fan_out)
-        # rank            : k*q=l*r
-        if type(num_blocks) == int:
-            self.num_blocks_in, self.num_blocks_out = num_blocks, num_blocks
-        else:
-            self.num_blocks_in, self.num_blocks_out = num_blocks # Tuple
-        
-        assert int(self.num_blocks_in) % int(self.rank) == 0 and int(self.num_blocks_out) % int(self.rank) == 0
-        
-        self.blk_height_in = int(self.rank) // int(self.num_blocks_in)
-        self.blk_width_in = int(math.ceil(self.fan_in / self.num_blocks_in))
-        self.blk_height_out = int(math.ceil(self.fan_in / self.num_blocks_in))
-        self.blk_width_out = int(self.rank) // int(self.num_blocks_out)
-        self.btfly_in, self.btfly_out = self.num_blocks_in * self.blk_width_in, self.num_blocks_out * self.blk_height_out
-        
-        self.lora_A = nn.Parameter(torch.zeros((self.num_blocks_in, self.blk_height_in, self.blk_width_in)))
-        self.lora_B = nn.Parameter(torch.zeros((self.num_blocks_out, self.blk_height_out, self.blk_width_out)))
-#         self.lora_A = nn.Parameter(torch.zeros(self.swap((rank, fan_in))))
-#         self.lora_B = nn.Parameter(torch.zeros(self.swap((fan_out, rank))))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        
-        self.lora_alpha = lora_alpha
-        self.scaling = lora_alpha / rank
-        self.lora_dropout = nn.Dropout(p=lora_dropout_p) if lora_dropout_p > 0 else lambda x: x
-        self.dropout_fn = self._dropout if lora_dropout_p > 0 else lambda x: x
-        self.register_buffer("lora_dropout_mask", torch.ones((1, fan_in), dtype=self.lora_A.dtype))
-#         self.register_buffer("lora_dropout_mask", torch.ones(self.swap((1, fan_in)), dtype=self.lora_A.dtype))
+        # self.swap = (lambda x: (x[1], x[0])) if fan_in_fan_out else (lambda x: x)
+        # self.lora_A = nn.Parameter(torch.zeros(self.swap((rank, fan_in))))
+        # self.lora_B = nn.Parameter(torch.zeros(self.swap((fan_out, rank))))
+        # nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        # self.lora_alpha, self.rank = lora_alpha, rank
+        # self.scaling = lora_alpha / rank
+        # self.lora_dropout = nn.Dropout(p=lora_dropout_p) if lora_dropout_p > 0 else lambda x: x
+        # self.dropout_fn = self._dropout if lora_dropout_p > 0 else lambda x: x
+        # self.register_buffer("lora_dropout_mask", torch.ones(self.swap((1, fan_in)), dtype=self.lora_A.dtype))
+        # self.forward_fn = self.lora_forward
+
+        '''
+        TODO:
+        - Re-enable swap for fan_in_fan_out; see lora_forward
+        - Scaling factor for monarch? Does current term make sense?
+        - ? dropout
+        '''
+        self.in_features = fan_in
+        self.out_features = fan_out
+        self.nblocks = nblocks
+        self.adapt = adapt
+        self.scaling = lora_alpha / (fan_in/nblocks) # higher nblocks -> smaller denominator, more sparsity
+        self.monarch = MonarchLinear(nblocks=4, adapt=adapt, in_features=fan_in, out_features=fan_out,
+                                     bias=False, device=None, dtype=None)
         self.forward_fn = self.lora_forward
 
     def _dropout(self, A):
@@ -64,12 +51,9 @@ class LoRAParametrization(nn.Module):
         return A * self.lora_dropout(self.lora_dropout_mask)
 
     def lora_forward(self, X):
-        if fan_in_fan_out:
-            return X + (torch.matmul(self.lora_B, self.dropout_fn(self.lora_A)).T).view(X.shape) * self.scaling
-        else:
-            return X + (torch.matmul(self.lora_B, self.dropout_fn(self.lora_A))).view(X.shape) * self.scaling
-#         return X + torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A)))).view(X.shape) * self.scaling
-
+        # return X + torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A)))).view(X.shape) * self.scaling
+        return X + self.monarch.forward_matmul(torch.eye(self.in_features)).T.view(X.shape) * self.scaling # TODO: swap and proper dim permutation?
+    
     def forward(self, X):
         return self.forward_fn(X)
 

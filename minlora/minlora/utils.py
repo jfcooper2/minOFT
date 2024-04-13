@@ -21,9 +21,13 @@ disable_lora = lambda model: model.apply(apply_to_lora(lambda x: x.disable_lora(
 
 def name_is_lora(name):
     return (
-        len(name.split(".")) >= 4
-        and (name.split(".")[-4]) == "parametrizations"
-        and name.split(".")[-1] in ["lora_A", "lora_B"]
+        # len(name.split(".")) >= 4
+        # and (name.split(".")[-4]) == "parametrizations"
+        # and name.split(".")[-1] in ["lora_A", "lora_B"]
+        len(name.split(".")) >= 5
+        and (name.split(".")[-5]) == "parametrizations"
+        and name.split(".")[-2] == "monarch"
+        and name.split(".")[-1] in ["blkdiag1", "blkdiag2"]
     )
 
 
