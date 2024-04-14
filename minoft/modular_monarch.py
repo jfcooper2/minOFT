@@ -326,7 +326,6 @@ def inject_trainable_monarch(
     for _module, name, _child_module in _find_modules(
         model, target_replace_module, search_class=[nn.Linear]
     ):
-        print(_module, name, _child_module)
         weight = _child_module.weight
         bias = _child_module.bias
         if verbose:
