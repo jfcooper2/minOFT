@@ -34,66 +34,6 @@ except ImportError:
 
 class MonarchInjectedLinear(nn.Module):
     def __init__(
-        self, in_features, out_features, bias=False, r=4, num_blocks=(4,4), dropout_p=0.1, scale=1.0
-    ):
-        super().__init__()
-
-        if r > min(in_features, out_features):
-            raise ValueError(
-                f"LoRA rank {r} must be less or equal than {min(in_features, out_features)}"
-            )
-        self.in_features, self.out_features = in_features, out_features
-        self.r = r
-        self.linear = nn.Linear(in_features, out_features, bias)
-        
-        if type(num_blocks) == int:
-            self.num_blocks_in, self.num_blocks_out = num_blocks, num_blocks
-        else:
-            self.num_blocks_in, self.num_blocks_out = num_blocks # Tuple
-        
-        if int(self.num_blocks_in) % int(self.r) != 0 and int(self.num_blocks_out) % int(self.r) != 0:
-            raise ValueError(
-                f"LoRA rank {r} must divide the number of block numbers"
-            )
-        
-        self.blk_height_in = int(self.r) // int(self.num_blocks_in)
-        self.blk_width_in = int(math.ceil(in_features / self.num_blocks_in))
-        self.blk_height_out = int(math.ceil(out_features / self.num_blocks_out))
-        self.blk_width_out = int(self.r) // int(self.num_blocks_out)
-        self.btfly_in, self.btfly_out = self.num_blocks_in * self.blk_width_in, self.num_blocks_out * self.blk_height_out
-        
-        self.monarch_R = nn.Parameter(torch.zeros((self.num_blocks_in, self.blk_height_in, self.blk_width_in)))
-        self.monarch_L = nn.Parameter(torch.zeros((self.num_blocks_out, self.blk_height_out, self.blk_width_out)))
-        self.dropout = nn.Dropout(dropout_p)
-        self.scale = scale
-        self.selector = nn.Identity()
-
-        nn.init.kaiming_uniform_(self.monarch_R, a=math.sqrt(5))
-        nn.init.zeros_(self.monarch_L)
-
-    def forward(self, input):
-        input_padded = np.zeros(self.btfly_in)
-        input_padded[:self.in_features]
-        return (
-            self.linear(input)
-            + self.dropout(blockdiag_butterfly_multiply(input, self.monarch_R, self.monarch_L)[:self.out_features])
-            * self.scale
-        )
-
-    def realize_as_lora(self):
-        return self.monarch_R.data * self.scale, monarch_L.lora_B.data
-
-    def set_selector_from_diag(self, diag: torch.Tensor):
-        # diag is a 1D tensor of size (r,)
-        assert diag.shape == (self.r,)
-        self.selector = nn.Linear(self.r, self.r, bias=False)
-        self.selector.weight.data = torch.diag(diag)
-        self.selector.weight.data = self.selector.weight.data.to(
-            self.monarch_R.device
-        ).to(self.monarch_R.dtype)
-
-class MonarchInjectedLinear_2(nn.Module):
-    def __init__(
         self, in_features, out_features, bias=True,
         num_blocks=4, adapt=True, 
         dropout_p=0.0, scale=1.0
@@ -132,16 +72,16 @@ class MonarchInjectedConv2d(nn.Module):
         dilation=1,
         groups: int = 1,
         bias: bool = True,
-        r: int = 4,
+        num_blocks: int = 4,
         dropout_p: float = 0.1,
         scale: float = 1.0,
     ):
         super().__init__()
-        if r > min(in_channels, out_channels):
-            raise ValueError(
-                f"LoRA rank {r} must be less or equal than {min(in_channels, out_channels)}"
-            )
-        self.r = r
+#         if r > min(in_channels, out_channels):
+#             raise ValueError(
+#                 f"LoRA rank {num_blocks} must be less or equal than {min(in_channels, out_channels)}"
+#             )
+        self.num_blocks = num_blocks
         self.conv = nn.Conv2d(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -153,6 +93,7 @@ class MonarchInjectedConv2d(nn.Module):
             bias=bias,
         )
 
+        # TODO: Change r to something with num_blocks
         self.lora_down = nn.Conv2d(
             in_channels=in_channels,
             out_channels=r,
@@ -243,7 +184,6 @@ def _find_modules_v2(
     search_class: List[Type[nn.Module]] = [nn.Linear],
     exclude_children_of: Optional[List[Type[nn.Module]]] = [
         MonarchInjectedLinear,
-        MonarchInjectedLinear_2,
         MonarchInjectedConv2d,
     ],
 ):
@@ -331,7 +271,7 @@ def inject_trainable_monarch(
         if verbose:
             print("Monarch LoRA Injection : injecting monarch into ", name)
             print("Monarch LoRA Injection : weight shape", weight.shape)
-        _tmp = MonarchInjectedLinear_2(
+        _tmp = MonarchInjectedLinear(
             _child_module.in_features,
             _child_module.out_features,
             _child_module.bias is not None,
@@ -352,8 +292,8 @@ def inject_trainable_monarch(
         require_grad_params.append(_module._modules[name].monarch.blkdiag2)
 
         if monarchs != None:
-            _module._modules[name].monarch.blkdiag1[...] = monarchs.pop(0)
-            _module._modules[name].monarch.blkdiag2[...] = monarchs.pop(0)
+            _module._modules[name].monarch.blkdiag1.data = monarchs.pop(0)
+            _module._modules[name].monarch.blkdiag1.data = monarchs.pop(0)
 
         _module._modules[name].monarch.blkdiag1.requires_grad = True
         _module._modules[name].monarch.blkdiag2.requires_grad = True
@@ -365,8 +305,11 @@ def inject_trainable_monarch(
 def inject_trainable_lora_extended(
     model: nn.Module,
     target_replace_module: Set[str] = UNET_EXTENDED_TARGET_REPLACE,
-    r: int = 4,
-    loras=None,  # path to lora .pt
+    num_blocks: int = 4, adapt:bool=True,
+    monarchs=None,  # path to monarch .pt
+    verbose: bool = False,
+    dropout_p: float = 0.0,
+    scale: float = 1.0,
 ):
     """
     inject lora into model, and returns lora parameter groups.
@@ -388,7 +331,10 @@ def inject_trainable_lora_extended(
                 _child_module.in_features,
                 _child_module.out_features,
                 _child_module.bias is not None,
-                r=r,
+                num_blocks=num_blocks,
+                adapt=adapt,
+                dropout_p=dropout_p,
+                scale=scale,
             )
             _tmp.linear.weight = weight
             if bias is not None:
@@ -405,7 +351,7 @@ def inject_trainable_lora_extended(
                 _child_module.dilation,
                 _child_module.groups,
                 _child_module.bias is not None,
-                r=r,
+                num_blocks=num_blocks,
             )
 
             _tmp.conv.weight = weight
@@ -864,9 +810,9 @@ def monkeypatch_or_replace_safeloras(models, safeloras):
 
 def monkeypatch_remove_lora(model):
     for _module, name, _child_module in _find_modules(
-        model, search_class=[MonarchInjectedLinear, MonarchInjectedLinear_2, MonarchInjectedConv2d]
+        model, search_class=[MonarchInjectedLinear, MonarchInjectedConv2d]
     ):
-        if isinstance(_child_module, MonarchInjectedLinear) or isinstance(_child_module, MonarchInjectedLinear_2):
+        if isinstance(_child_module, MonarchInjectedLinear):
             _source = _child_module.linear
             weight, bias = _source.weight, _source.bias
 
