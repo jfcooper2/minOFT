@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .src.models.layers.monarch_linear import MonarchLinear
 from .blockdiag_butterfly_multiply import blockdiag_butterfly_multiply
 
 try:
@@ -33,7 +34,7 @@ except ImportError:
 
 class MonarchInjectedLinear(nn.Module):
     def __init__(
-        self, in_features, out_features, bias=False, r=4, num_blocks=(4,4) dropout_p=0.1, scale=1.0
+        self, in_features, out_features, bias=False, r=4, num_blocks=(4,4), dropout_p=0.1, scale=1.0
     ):
         super().__init__()
 
@@ -45,7 +46,7 @@ class MonarchInjectedLinear(nn.Module):
         self.r = r
         self.linear = nn.Linear(in_features, out_features, bias)
         
-         if type(num_blocks) == int:
+        if type(num_blocks) == int:
             self.num_blocks_in, self.num_blocks_out = num_blocks, num_blocks
         else:
             self.num_blocks_in, self.num_blocks_out = num_blocks # Tuple
@@ -90,6 +91,34 @@ class MonarchInjectedLinear(nn.Module):
         self.selector.weight.data = self.selector.weight.data.to(
             self.monarch_R.device
         ).to(self.monarch_R.dtype)
+
+class MonarchInjectedLinear_2(nn.Module):
+    def __init__(
+        self, in_features, out_features, bias=True,
+        num_blocks=4, adapt=True, 
+        dropout_p=0.0, scale=1.0
+    ):
+        super().__init__()
+
+        # if r > min(in_features, out_features):
+        #     raise ValueError(
+        #         f"LoRA rank {r} must be less or equal than {min(in_features, out_features)}"
+        #     )
+        self.dropout = nn.Dropout(dropout_p)
+        self.scale = scale
+        self.in_features, self.out_features = in_features, out_features
+        self.linear = nn.Linear(in_features, out_features, bias)
+        self.monarch = MonarchLinear(nblocks=num_blocks, adapt=adapt,
+                                     in_features=in_features, out_features=out_features, bias=False, device=None, dtype=None)
+    
+    def forward(self, input):
+        return (
+            self.linear(input)
+            + self.dropout(self.monarch.forward_matmul(input))* self.scale
+        )
+
+    def realize_as_lora(self):
+        return self.monarch.blkdiag1.data * self.scale, self.monarch.blkdiag2.data
 
 
 class MonarchInjectedConv2d(nn.Module):
@@ -214,6 +243,7 @@ def _find_modules_v2(
     search_class: List[Type[nn.Module]] = [nn.Linear],
     exclude_children_of: Optional[List[Type[nn.Module]]] = [
         MonarchInjectedLinear,
+        MonarchInjectedLinear_2,
         MonarchInjectedConv2d,
     ],
 ):
@@ -277,7 +307,7 @@ _find_modules = _find_modules_v2
 def inject_trainable_monarch(
     model: nn.Module,
     target_replace_module: Set[str] = DEFAULT_TARGET_REPLACE,
-    r: int = 4,
+    num_blocks: int = 4, adapt:bool=True,
     monarchs=None,  # path to monarch .pt
     verbose: bool = False,
     dropout_p: float = 0.0,
@@ -296,16 +326,18 @@ def inject_trainable_monarch(
     for _module, name, _child_module in _find_modules(
         model, target_replace_module, search_class=[nn.Linear]
     ):
+        print(_module, name, _child_module)
         weight = _child_module.weight
         bias = _child_module.bias
         if verbose:
             print("Monarch LoRA Injection : injecting monarch into ", name)
             print("Monarch LoRA Injection : weight shape", weight.shape)
-        _tmp = MonarchInjectedLinear(
+        _tmp = MonarchInjectedLinear_2(
             _child_module.in_features,
             _child_module.out_features,
             _child_module.bias is not None,
-            r=r,
+            num_blocks=num_blocks,
+            adapt=adapt,
             dropout_p=dropout_p,
             scale=scale,
         )
@@ -317,15 +349,15 @@ def inject_trainable_monarch(
         _tmp.to(_child_module.weight.device).to(_child_module.weight.dtype)
         _module._modules[name] = _tmp
 
-        require_grad_params.append(_module._modules[name].monarch_R)
-        require_grad_params.append(_module._modules[name].monarch_L)
+        require_grad_params.append(_module._modules[name].monarch.blkdiag1)
+        require_grad_params.append(_module._modules[name].monarch.blkdiag2)
 
         if monarchs != None:
-            _module._modules[name].monarch_R[...] = monarchs.pop(0)
-            _module._modules[name].monarch_L[...] = monarchs.pop(0)
+            _module._modules[name].monarch.blkdiag1[...] = monarchs.pop(0)
+            _module._modules[name].monarch.blkdiag2[...] = monarchs.pop(0)
 
-        _module._modules[name].monarch_R.requires_grad = True
-        _module._modules[name].monarch_L.requires_grad = True
+        _module._modules[name].monarch.blkdiag1.requires_grad = True
+        _module._modules[name].monarch.blkdiag2.requires_grad = True
         names.append(name)
 
     return require_grad_params, names
@@ -833,9 +865,9 @@ def monkeypatch_or_replace_safeloras(models, safeloras):
 
 def monkeypatch_remove_lora(model):
     for _module, name, _child_module in _find_modules(
-        model, search_class=[MonarchInjectedLinear, MonarchInjectedConv2d]
+        model, search_class=[MonarchInjectedLinear, MonarchInjectedLinear_2, MonarchInjectedConv2d]
     ):
-        if isinstance(_child_module, MonarchInjectedLinear):
+        if isinstance(_child_module, MonarchInjectedLinear) or isinstance(_child_module, MonarchInjectedLinear_2):
             _source = _child_module.linear
             weight, bias = _source.weight, _source.bias
 
