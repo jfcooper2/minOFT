@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .src.models.layers.monarch_linear import MonarchLinear
+from .src.models.layers.monarch_linear_wx import MonarchLinearWX
 from .blockdiag_butterfly_multiply import blockdiag_butterfly_multiply
 
 try:
@@ -59,8 +60,7 @@ class MonarchInjectedLinear(nn.Module):
 
     def realize_as_lora(self):
         return self.monarch.blkdiag1.data * self.scale, self.monarch.blkdiag2.data
-
-
+        
 class MonarchInjectedConv2d(nn.Module):
     def __init__(
         self,
@@ -247,6 +247,7 @@ _find_modules = _find_modules_v2
 def inject_trainable_monarch(
     model: nn.Module,
     target_replace_module: Set[str] = DEFAULT_TARGET_REPLACE,
+    use_monarch_wx=False, 
     num_blocks: int = 4, adapt:bool=True,
     monarchs=None,  # path to monarch .pt
     verbose: bool = False,
@@ -271,32 +272,53 @@ def inject_trainable_monarch(
         if verbose:
             print("Monarch Injection : injecting monarch into ", name)
             print("Monarch Injection : weight shape", weight.shape)
-        _tmp = MonarchInjectedLinear(
-            _child_module.in_features,
-            _child_module.out_features,
-            _child_module.bias is not None,
-            num_blocks=num_blocks,
-            adapt=adapt,
-            dropout_p=dropout_p,
-            scale=scale,
-        )
-        _tmp.linear.weight = weight
-        if bias is not None:
-            _tmp.linear.bias = bias
+
+        if use_monarch_wx:
+            config = {
+                "nblocks": 4,
+                "blk_r": 4,
+                "blk_sz": None,
+                "square": False,
+                "adapter": True,
+            }
+            _tmp = MonarchLinearWX(
+                in_features=_child_module.in_features,
+                out_features=_child_module.out_features,
+                peft_config=config,
+                nblocks=num_blocks,
+                weights=weight.data,
+                device=weight.device,
+                dtype=weight.dtype,
+            )
+        else:
+            _tmp = MonarchInjectedLinear(
+                _child_module.in_features,
+                _child_module.out_features,
+                _child_module.bias is not None,
+                num_blocks=num_blocks,
+                adapt=adapt,
+                dropout_p=dropout_p,
+                scale=scale,
+            )
+            _tmp.linear.weight = weight
+            if bias is not None:
+                _tmp.linear.bias = bias
 
         # switch the module
         _tmp.to(_child_module.weight.device).to(_child_module.weight.dtype)
         _module._modules[name] = _tmp
 
-        require_grad_params.append(_module._modules[name].monarch.blkdiag1)
-        require_grad_params.append(_module._modules[name].monarch.blkdiag2)
+        monarch_module_ = _module._modules[name] if use_monarch_wx else _module._modules[name].monarch
+        
+        require_grad_params.append(monarch_module_.blkdiag1)
+        require_grad_params.append(monarch_module_.blkdiag2)
 
         if monarchs != None:
-            _module._modules[name].monarch.blkdiag1.data = monarchs.pop(0)
-            _module._modules[name].monarch.blkdiag1.data = monarchs.pop(0)
+            monarch_module_.blkdiag1.data = monarchs.pop(0)
+            monarch_module_.blkdiag2.data = monarchs.pop(0)
 
-        _module._modules[name].monarch.blkdiag1.requires_grad = True
-        _module._modules[name].monarch.blkdiag2.requires_grad = True
+        monarch_module_.blkdiag1.requires_grad = True
+        monarch_module_.blkdiag2.requires_grad = True
         names.append(name)
 
     return require_grad_params, names

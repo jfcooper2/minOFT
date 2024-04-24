@@ -109,3 +109,50 @@ class BlockdiagButterflyMultiply(torch.autograd.Function):
         return dx, dw1_bfly, dw2_bfly
 
 blockdiag_butterfly_multiply = BlockdiagButterflyMultiply.apply
+
+class BlockdiagMultiply(torch.autograd.Function):
+
+    """This is a faster implementation, with careful memory copies for the fastest
+    bmm performance.
+    The backward pass is also written manually with careful memory copies.
+    Arguments:
+        x: (..., n)
+        weight: (nblocks, q, n / nblocks)
+    Outputs:
+        out: (..., nblocks * q)
+    """
+
+    @staticmethod
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float16)
+    def forward(ctx, x, weight):
+        ctx.save_for_backward(x, weight)
+        batch_shape, n = x.shape[:-1], x.shape[-1]
+        batch_dim = np.prod(batch_shape)
+        nblocks, q, p = weight.shape
+        assert nblocks * p == n
+        x_reshaped = x.reshape(batch_dim, nblocks, p).transpose(0, 1) # (nblocks, batch_dim, p)
+        out = torch.empty(batch_dim, nblocks, q, device=x.device, dtype=x.dtype).transpose(0, 1)
+        out = torch.bmm(x_reshaped, weight.transpose(-1, -2), out=out).transpose(0, 1) # (nblocks, batch_dim, blk_sz) @ (nblocks, blk_sz, blk_r) -> (nblocks, batch_dim, q)
+        return out.reshape(*batch_shape, nblocks * q)
+
+    @staticmethod
+    @torch.cuda.amp.custom_bwd
+    def backward(ctx, dout):
+        x, weight = ctx.saved_tensors
+        batch_shape, n = x.shape[:-1], x.shape[-1]
+        batch_dim = np.prod(batch_shape)
+        nblocks, q, p = weight.shape
+        assert nblocks * p == n
+        dx, dweight = None, None
+        dout_reshaped = dout.reshape(batch_dim, nblocks, q).transpose(0, 1)
+        if ctx.needs_input_grad[0]:
+            dx = torch.empty(batch_dim, nblocks, p, device=x.device, dtype=x.dtype)
+            dx = torch.bmm(dout_reshaped, weight.conj(),
+                           out=dx.transpose(0, 1)).transpose(0, 1).reshape(*batch_shape, n)
+        if ctx.needs_input_grad[1]:
+            x_reshaped = x.reshape(batch_dim, nblocks, p).transpose(0, 1)
+            dweight = torch.bmm(dout_reshaped.transpose(-1, -2), x_reshaped.conj())
+        return dx, dweight
+
+
+single_monarch_mult = BlockdiagMultiply.apply
