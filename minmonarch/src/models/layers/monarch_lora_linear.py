@@ -19,9 +19,11 @@ class MonarchLoraLinear(StructuredLinear):
     def __init__(self, *args, nblocks:int=4, r:int=4, adapt:bool=True, **kwargs):
         super().__init__(*args, **kwargs)
         in_blksz = int(math.ceil(self.in_features / nblocks))
-        in_blkr = int(math.ceil(r / nblocks))
+        in_blkr = r
+        #in_blkr = int(math.ceil(r / nblocks))
         out_blksz = int(math.ceil(self.out_features / nblocks))
-        out_blkr = int(math.ceil(r / nblocks))
+        out_blkr = r
+        #out_blkr = int(math.ceil(r / nblocks))
         
         self.in_features_extended = in_blksz * nblocks
         self.rank = r

@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .src.models.layers.monarch_linear import MonarchLinear
+from .src.models.layers.monarch_lora_linear import MonarchLoraLinear
 from .src.models.layers.monarch_linear_wx import MonarchLinearWX
 from .blockdiag_butterfly_multiply import blockdiag_butterfly_multiply
 
@@ -50,6 +51,34 @@ class MonarchInjectedLinear(nn.Module):
         self.in_features, self.out_features = in_features, out_features
         self.linear = nn.Linear(in_features, out_features, bias)
         self.monarch = MonarchLinear(nblocks=num_blocks, adapt=adapt,
+                                     in_features=in_features, out_features=out_features, bias=False, device=None, dtype=None)
+    
+    def forward(self, input):
+        return (
+            self.linear(input)
+            + self.dropout(self.monarch.forward_matmul(input))* self.scale
+        )
+
+    def realize_as_lora(self):
+        return self.monarch.blkdiag1.data * self.scale, self.monarch.blkdiag2.data
+        
+class MonarchLoraInjectedLinear(nn.Module):
+    def __init__(
+        self, in_features, out_features, bias=True,
+        num_blocks=4, rank=4, adapt=True, 
+        dropout_p=0.0, scale=1.0
+    ):
+        super().__init__()
+
+        # if r > min(in_features, out_features):
+        #     raise ValueError(
+        #         f"LoRA rank {r} must be less or equal than {min(in_features, out_features)}"
+        #     )
+        self.dropout = nn.Dropout(dropout_p)
+        self.scale = scale
+        self.in_features, self.out_features = in_features, out_features
+        self.linear = nn.Linear(in_features, out_features, bias)
+        self.monarch = MonarchLoraLinear(nblocks=num_blocks, rank=rank, adapt=adapt,
                                      in_features=in_features, out_features=out_features, bias=False, device=None, dtype=None)
     
     def forward(self, input):
@@ -248,7 +277,10 @@ def inject_trainable_monarch(
     model: nn.Module,
     target_replace_module: Set[str] = DEFAULT_TARGET_REPLACE,
     use_monarch_wx=False, 
-    num_blocks: int = 4, adapt:bool=True,
+    use_monarch_lora=False, 
+    num_blocks: int = 4, 
+    rank: int = 4,
+    adapt:bool=True,
     monarchs=None,  # path to monarch .pt
     verbose: bool = False,
     dropout_p: float = 0.0,
@@ -276,7 +308,7 @@ def inject_trainable_monarch(
         if use_monarch_wx:
             config = {
                 "nblocks": 4,
-                "blk_r": 4,
+                "blk_r": rank,
                 "blk_sz": None,
                 "square": False,
                 "adapter": True,
@@ -290,6 +322,22 @@ def inject_trainable_monarch(
                 device=weight.device,
                 dtype=weight.dtype,
             )
+
+        elif use_monarch_lora:
+            _tmp = MonarchLoraInjectedLinear(
+                _child_module.in_features,
+                _child_module.out_features,
+                _child_module.bias is not None,
+                num_blocks=num_blocks,
+                rank=rank,
+                adapt=adapt,
+                dropout_p=dropout_p,
+                scale=scale,
+            )
+            _tmp.linear.weight = weight
+            if bias is not None:
+                _tmp.linear.bias = bias
+
         else:
             _tmp = MonarchInjectedLinear(
                 _child_module.in_features,
